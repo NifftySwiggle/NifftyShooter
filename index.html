@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>NifftyShooter</title>
+<style>
+  html,body{height:100%;margin:0;background:#111;color:#eee;font-family:Segoe UI,Arial;}
+  canvas{display:block}
+  #hud{position:fixed;left:10px;top:10px;background:rgba(0,0,0,0.6);padding:10px;border-radius:8px;width:280px;z-index:10}
+  #hud h3{margin:0 0 6px 0}
+  #lobbies{max-height:160px;overflow:auto;margin-top:10px}
+  .lobbyItem{padding:6px;border:1px solid #333;margin-bottom:6px;border-radius:6px;background:#222;cursor:pointer}
+  .lobbyItem:hover{background:#444}
+  #health{height:14px;background:#400;border-radius:6px;overflow:hidden}
+  #healthFill{height:100%;background:#f00;width:100%}
+  #weapon{font-weight:bold;margin-top:6px}
+  #powerups{font-size:13px;color:#aaf}
+</style>
+</head>
+<body>
+<div id="hud">
+  <h3>NifftyShooter</h3>
+  <div>Lobby: <span id="lobbyName">—</span></div>
+  <div>Status: <span id="status">Connecting</span></div>
+  <div style="margin-top:8px">HP:</div>
+  <div id="health"><div id="healthFill"></div></div>
+  <div id="weapon">Weapon: —</div>
+  <div id="powerups">Power-ups: —</div>
+  <div id="kills">Kills: 0</div>
+  <hr style="border-color:#333" />
+  <div><strong>Available Lobbies</strong></div>
+  <div id="lobbies"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+<script>
+(() => {
+  const SERVER = 'wss://https://nifftyshooter.onrender.com';
+  let ws;
+  let myId = null;
+  let currentLobby = null;
+  const players = new Map(); // id -> player data (from server)
+  let bullets = [];
+  let pickups = [];
+  let obstacles = [];
+
+  // THREE setup
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  // floor
+  const MAP_SIZE = 50;
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(MAP_SIZE*2, MAP_SIZE*2), new THREE.MeshPhongMaterial({color:0x222222}));
+  floor.rotation.x = Math.PI/2; scene.add(floor);
+
+  // lights
+  scene.add(new THREE.AmbientLight(0xffffff,0.4));
+  const dl = new THREE.DirectionalLight(0xffffff,0.8); dl.position.set(40,80,30); scene.add(dl);
+
+  // object stores
+  const playerMeshes = new Map();
+  const gunMeshes = new Map();
+  const bulletMeshes = new Map();
+  const pickupMeshes = new Map();
+  let obstacleMeshes = [];
+
+  // HUD elements
+  const lobbyNameEl = document.getElementById('lobbyName');
+  const statusEl = document.getElementById('status');
+  const lobbiesEl = document.getElementById('lobbies');
+  const healthFill = document.getElementById('healthFill');
+  const weaponEl = document.getElementById('weapon');
+  const powerupsEl = document.getElementById('powerups');
+  const killsEl = document.getElementById('kills');
+
+  // camera follow variables
+  function updateCamera(){
+    const me = players.get(myId);
+    if(!me) return;
+    camera.position.set(me.x, 28, me.y + 20);
+    camera.lookAt(me.x, 0, me.y);
+  }
+
+  // create obstacle meshes
+  function updateObstacles(obs){
+    obstacleMeshes.forEach(m => scene.remove(m));
+    obstacleMeshes = [];
+    obs.forEach(o => {
+      const g = new THREE.BoxGeometry(o.w,6,o.h);
+      const m = new THREE.Mesh(g,new THREE.MeshPhongMaterial({color:0x666666}));
+      m.position.set(o.x + o.w/2, 3, o.y + o.h/2);
+      scene.add(m); obstacleMeshes.push(m);
+    });
+  }
+
+  // create/update player
+  function upsertPlayer(p){
+    let mesh = playerMeshes.get(p.id);
+    if(!mesh){
+      const sphere = new THREE.Mesh(new THREE.SphereGeometry(1,16,16), new THREE.MeshPhongMaterial({color: p.id===myId ? 0x00ff88 : 0xff6666}));
+      scene.add(sphere); mesh = sphere; playerMeshes.set(p.id, sphere);
+      // gun
+      const gun = new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.1,1.2), new THREE.MeshPhongMaterial({color:0x3355ff}));
+      gun.rotation.z = Math.PI/2; scene.add(gun); gunMeshes.set(p.id, gun);
+    }
+    mesh.position.set(p.x,1,p.y);
+    mesh.rotation.y = p.rot || 0;
+    const gun = gunMeshes.get(p.id);
+    if(gun){
+      const dist = 1 + 0.75;
+      gun.position.set(p.x + Math.sin(p.rot || 0)*dist, 1.2, p.y + Math.cos(p.rot || 0)*dist);
+      gun.rotation.y = p.rot || 0;
+    }
+  }
+
+  // bullets visual
+  function upsertBullet(b){
+    let m = bulletMeshes.get(b.id);
+    if(!m){
+      m = new THREE.Mesh(new THREE.SphereGeometry(0.2), new THREE.MeshPhongMaterial({color:0xffff55}));
+      scene.add(m); bulletMeshes.set(b.id, m);
+    }
+    m.position.set(b.x, 0.2, b.y);
+  }
+
+  // pickups visual
+  function upsertPickup(p){
+    let m = pickupMeshes.get(p.id);
+    if(!m){
+      let geom, mat;
+      if(p.type === 'gun'){ geom = new THREE.BoxGeometry(0.9,0.9,0.9); mat = new THREE.MeshPhongMaterial({color:0x00ff00}); }
+      else { geom = new THREE.OctahedronGeometry(0.9); mat = new THREE.MeshPhongMaterial({color:0xff00ff}); }
+      m = new THREE.Mesh(geom, mat);
+      scene.add(m); pickupMeshes.set(p.id, m);
+    }
+    m.position.set(p.x, 0.5, p.y);
+  }
+
+  function cleanupEntities(serverBullets, serverPickups){
+    const bset = new Set(serverBullets.map(b=>b.id));
+    for(const [id,m] of bulletMeshes.entries()){
+      if(!bset.has(id)){ scene.remove(m); bulletMeshes.delete(id); }
+    }
+    const pset = new Set(serverPickups.map(p=>p.id));
+    for(const [id,m] of pickupMeshes.entries()){
+      if(!pset.has(id)){ scene.remove(m); pickupMeshes.delete(id); }
+    }
+  }
+
+  // networking
+  function connect(){
+    ws = new WebSocket(SERVER);
+    ws.onopen = ()=>{ statusEl.textContent = 'Connected'; /* auto join AUS */ send({type:'joinLobby', lobbyId:'aus'}); };
+    ws.onmessage = e => {
+      const msg = JSON.parse(e.data);
+      switch(msg.type){
+        case 'welcome': myId = msg.playerId; break;
+        case 'lobbyList': renderLobbies(msg.lobbies); break;
+        case 'lobbyCreated': currentLobby = msg.lobbyId; lobbyNameEl.textContent = currentLobby; break;
+        case 'lobbyJoined':
+          currentLobby = msg.lobbyId; lobbyNameEl.textContent = currentLobby;
+          if(msg.obstacles) { obstacles = msg.obstacles; updateObstacles(obstacles); }
+          if(msg.pickups) { pickups = msg.pickups; pickups.forEach(upsertPickup); }
+          break;
+        case 'players':
+          // update arrays
+          bullets = msg.bullets || [];
+          pickups = msg.pickups || [];
+          obstacles = msg.obstacles || obstacles;
+          updateObstacles(obstacles);
+          // update players
+          const servers = new Set();
+          (msg.players||[]).forEach(p => { servers.add(p.id); players.set(p.id,p); upsertPlayer(p); });
+          // remove absent players
+          for(const id of [...players.keys()]) if(!servers.has(id)){ players.delete(id); const m = playerMeshes.get(id); if(m){ scene.remove(m); playerMeshes.delete(id);} const g = gunMeshes.get(id); if(g){ scene.remove(g); gunMeshes.delete(id);} }
+          // update bullets & pickups
+          bullets.forEach(upsertBullet);
+          pickups.forEach(upsertPickup);
+          cleanupEntities(bullets,pickups);
+          // HUD update
+          const me = players.get(myId);
+          if(me){
+            healthFill.style.width = `${Math.max(0,Math.min(100,me.hp))}%`;
+            weaponEl.textContent = `Weapon: ${me.weapon || '—'}`;
+            powerupsEl.textContent = `Power-ups: ${me.speedMultiplier>1 ? 'Speed' : 'None'}`;
+            killsEl.textContent = `Kills: ${me.kills || 0}`;
+          }
+          updateCamera();
+          break;
+        case 'pickupTaken':
+          // brief visual could be added — server will remove pickup in players message
+          break;
+        case 'playerKilled':
+          // show toast? ignore for simplicity
+          break;
+        case 'gameOver':
+          alert('Game over! Winner: ' + msg.winnerId);
+          break;
+        case 'error':
+          alert('Server error: '+msg.msg);
+          break;
+      }
+    };
+    ws.onclose = ()=>{ statusEl.textContent='Disconnected'; setTimeout(connect,2000); };
+    ws.onerror = ()=>{ statusEl.textContent='Error'; };
+  }
+
+  function send(obj){
+    if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function renderLobbies(lobbies){
+    lobbiesEl.innerHTML = '';
+    lobbies.forEach(l => {
+      const div = document.createElement('div'); div.className='lobbyItem';
+      div.textContent = `${l.id.toUpperCase()} (${l.region}) — ${l.playersCount} players ${l.alwaysOpen ? '[Always]' : (l.gameStarted ? '[Playing]' : '[Waiting]')}`;
+      div.onclick = ()=> { if(currentLobby===l.id) return; send({type:'joinLobby', lobbyId:l.id}); };
+      lobbiesEl.appendChild(div);
+    });
+  }
+
+  // Inputs & shooting
+  const keys = {};
+  window.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+  window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+  let mouseDown = false, mouseX=0, mouseY=0, aimAngle=0;
+  renderer.domElement.addEventListener('mousedown', e=> mouseDown = true);
+  renderer.domElement.addEventListener('mouseup', e=> mouseDown = false);
+  renderer.domElement.addEventListener('mousemove', e=> { mouseX=e.clientX; mouseY=e.clientY; updateAim(); });
+
+  function updateAim(){
+    const me = players.get(myId); if(!me) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const nx = ((mouseX - rect.left) / rect.width) * 2 - 1;
+    const ny = -((mouseY - rect.top) / rect.height) * 2 + 1;
+    const vec = new THREE.Vector3(nx, ny, 0.5).unproject(camera);
+    const dir = vec.sub(camera.position).normalize();
+    const dist = (me.y - camera.position.y) / dir.y;
+    const pos = camera.position.clone().add(dir.multiplyScalar(dist));
+    aimAngle = Math.atan2(pos.x - me.x, pos.z - me.y);
+  }
+
+  // game loop client-side: move & send state & shoot
+  let lastShot = 0;
+  const SHOT_COOLDOWN = 250;
+  function clientTick(dt){
+    const me = players.get(myId);
+    if(!me) return;
+    let dx=0, dy=0;
+    if(keys['w']||keys['arrowup']) dy+=1;
+    if(keys['s']||keys['arrowdown']) dy-=1;
+    if(keys['a']||keys['arrowleft']) dx-=1;
+    if(keys['d']||keys['arrowright']) dx+=1;
+    if(dx!==0 || dy!==0){
+      const len = Math.sqrt(dx*dx+dy*dy); dx/=len; dy/=len;
+      const speedMult = me.speedMultiplier || 1;
+      me.x += dx * (15 * speedMult) * dt;
+      me.y += dy * (15 * speedMult) * dt;
+      me.x = Math.max(-MAP_SIZE, Math.min(MAP_SIZE, me.x));
+      me.y = Math.max(-MAP_SIZE, Math.min(MAP_SIZE, me.y));
+    }
+    // smooth rotate to aimAngle
+    const diff = aimAngle - (me.rot||0);
+    let d = diff;
+    if(d > Math.PI) d-=2*Math.PI; else if(d<-Math.PI) d+=2*Math.PI;
+    const mr = 5 * dt;
+    me.rot += Math.sign(d)*Math.min(Math.abs(d), mr);
+
+    send({type:'updateState', x: me.x, y: me.y, rot: me.rot});
+    if(mouseDown && Date.now()-lastShot > SHOT_COOLDOWN){ send({type:'shoot'}); lastShot = Date.now(); }
+  }
+
+  // animation
+  let lastTime = performance.now();
+  function animate(t){
+    const dt = (t - lastTime)/1000; lastTime = t;
+    clientTick(dt);
+    renderer.render(scene, camera);
+    requestAnimationFrame(animate);
+  }
+
+  // update camera when resize
+  window.addEventListener('resize', ()=>{ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+  // start
+  connect();
+  animate();
+
+})();
+</script>
+</body>
+</html>
