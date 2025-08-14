@@ -1,9 +1,41 @@
-// server.js
+const express = require('express');
+const http = require('http');
 const WebSocket = require('ws');
+const path = require('path');
+const cors = require('cors');
 
-const PORT = 8080;
-const wss = new WebSocket.Server({ port: PORT });
-console.log(`Server running on ws://localhost:${PORT}`);
+const app = express();
+app.use(cors());
+app.use(express.static(__dirname));
+
+// Serve the main HTML file
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// Handle WebSocket connections
+wss.on('connection', (ws) => {
+  console.log('New WebSocket connection');
+
+  ws.on('message', (message) => {
+    console.log('Received:', message);
+    ws.send(`Echo: ${message}`);
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket connection closed');
+  });
+});
+
+// Start the server
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`); 
+});
+
 
 /* === Game settings === */
 const TICK_MS = 33; // ~30 updates/sec
